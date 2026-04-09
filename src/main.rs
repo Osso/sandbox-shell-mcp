@@ -16,6 +16,9 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 type SessionMap = Arc<Mutex<HashMap<String, PtySession>>>;
+
+const ESC: char = '\x1b';
+const BEL: char = '\x07';
 const RANDOM_ID_MASK: u128 = 0xFFFF_FFFF;
 
 struct PtySession {
@@ -93,7 +96,7 @@ fn strip_ansi(input: &[u8]) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
+        if c == ESC {
             consume_escape_sequence(&mut chars);
         } else if c != '\r' {
             result.push(c);
@@ -124,13 +127,15 @@ fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+/// OSC sequences end with BEL or ST (ESC + backslash).
 fn consume_osc_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    let mut saw_escape = false;
-    for next in chars.by_ref() {
-        if next == '\x07' || (saw_escape && next == '\\') {
+    let mut prev_was_esc = false;
+    for c in chars.by_ref() {
+        let is_terminator = c == BEL || (prev_was_esc && c == '\\');
+        if is_terminator {
             return;
         }
-        saw_escape = next == '\x1b';
+        prev_was_esc = c == ESC;
     }
 }
 
