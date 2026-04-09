@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 type SessionMap = Arc<Mutex<HashMap<String, PtySession>>>;
+const RANDOM_ID_MASK: u128 = 0xFFFF_FFFF;
 
 struct PtySession {
     writer: Box<dyn Write + Send>,
@@ -102,32 +103,34 @@ fn strip_ansi(input: &[u8]) -> String {
 }
 
 fn consume_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    match chars.peek() {
-        Some(&'[') => {
-            chars.next();
-            while let Some(&next) = chars.peek() {
-                chars.next();
-                if next.is_ascii_alphabetic() || next == '~' {
-                    break;
-                }
-            }
+    let Some(prefix) = chars.next() else {
+        return;
+    };
+
+    if prefix == '[' {
+        consume_csi_sequence(chars);
+        return;
+    }
+    if prefix == ']' {
+        consume_osc_sequence(chars);
+    }
+}
+
+fn consume_csi_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    for next in chars.by_ref() {
+        if next.is_ascii_alphabetic() || next == '~' {
+            return;
         }
-        Some(&']') => {
-            chars.next();
-            while let Some(&next) = chars.peek() {
-                chars.next();
-                if next == '\x07' {
-                    break;
-                }
-                if next == '\x1b' && chars.peek() == Some(&'\\') {
-                    chars.next();
-                    break;
-                }
-            }
+    }
+}
+
+fn consume_osc_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let mut saw_escape = false;
+    for next in chars.by_ref() {
+        if next == '\x07' || (saw_escape && next == '\\') {
+            return;
         }
-        _ => {
-            chars.next();
-        }
+        saw_escape = next == '\x1b';
     }
 }
 
@@ -158,13 +161,31 @@ fn spawn_pty_session(params: &PtyStartParams) -> Result<(String, PtySession), St
         pixel_width: 0,
         pixel_height: 0,
     };
-    let pair = pty_system.openpty(size).map_err(|e| format!("failed to open PTY: {e}"))?;
+    let pair = pty_system
+        .openpty(size)
+        .map_err(|e| format!("failed to open PTY: {e}"))?;
     let cmd = build_command(params);
-    let child = pair.slave.spawn_command(cmd).map_err(|e| format!("failed to spawn: {e}"))?;
-    let reader = pair.master.try_clone_reader().map_err(|e| format!("reader: {e}"))?;
-    let writer = pair.master.take_writer().map_err(|e| format!("writer: {e}"))?;
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("failed to spawn: {e}"))?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("writer: {e}"))?;
     let session_id = format!("pty-{}", rand_id());
-    Ok((session_id, PtySession { writer, reader, child }))
+    Ok((
+        session_id,
+        PtySession {
+            writer,
+            reader,
+            child,
+        },
+    ))
 }
 
 fn rand_id() -> String {
@@ -173,20 +194,21 @@ fn rand_id() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    format!("{:x}", t & 0xFFFF_FFFF)
+    format!("{:x}", t & RANDOM_ID_MASK)
 }
 
 #[tool_router]
 impl PtyMcp {
-    #[tool(
-        description = "Start an interactive PTY session with a command. Returns a session ID."
-    )]
+    #[tool(description = "Start an interactive PTY session with a command. Returns a session ID.")]
     async fn pty_start(&self, Parameters(params): Parameters<PtyStartParams>) -> String {
         let (session_id, session) = match spawn_pty_session(&params) {
             Ok(v) => v,
             Err(e) => return format!("Error: {e}"),
         };
-        self.sessions.lock().await.insert(session_id.clone(), session);
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let initial = {
