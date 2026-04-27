@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 type SessionMap = Arc<Mutex<HashMap<String, PtySession>>>;
+type OutputBuffer = Arc<StdMutex<Vec<u8>>>;
 
 const ESC: char = '\x1b';
 const BEL: char = '\x07';
@@ -23,7 +24,7 @@ const RANDOM_ID_MASK: u128 = 0xFFFF_FFFF;
 
 struct PtySession {
     writer: Box<dyn Write + Send>,
-    reader: Box<dyn Read + Send>,
+    output: OutputBuffer,
     child: Box<dyn portable_pty::Child + Send + Sync>,
 }
 
@@ -76,19 +77,36 @@ struct PtyCloseParams {
     session_id: String,
 }
 
-fn read_available(reader: &mut dyn Read) -> String {
-    let mut buf = [0u8; 16_384];
-    let mut output = Vec::new();
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => output.extend_from_slice(&buf[..n]),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
-            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => break,
+fn drain_buffer(buffer: &OutputBuffer) -> String {
+    let bytes = {
+        let mut b = match buffer.lock() {
+            Ok(b) => b,
+            Err(p) => p.into_inner(),
+        };
+        std::mem::take(&mut *b)
+    };
+    strip_ansi(&bytes)
+}
+
+fn spawn_reader_thread(mut reader: Box<dyn Read + Send>, buffer: OutputBuffer) {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 16_384];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = &buf[..n];
+                    let mut b = match buffer.lock() {
+                        Ok(b) => b,
+                        Err(p) => p.into_inner(),
+                    };
+                    b.extend_from_slice(chunk);
+                }
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
         }
-    }
-    strip_ansi(&output)
+    });
 }
 
 fn strip_ansi(input: &[u8]) -> String {
@@ -183,11 +201,13 @@ fn spawn_pty_session(params: &PtyStartParams) -> Result<(String, PtySession), St
         .take_writer()
         .map_err(|e| format!("writer: {e}"))?;
     let session_id = format!("pty-{}", rand_id());
+    let output: OutputBuffer = Arc::new(StdMutex::new(Vec::new()));
+    spawn_reader_thread(reader, output.clone());
     Ok((
         session_id,
         PtySession {
             writer,
-            reader,
+            output,
             child,
         },
     ))
@@ -210,20 +230,14 @@ impl PtyMcp {
             Ok(v) => v,
             Err(e) => return format!("Error: {e}"),
         };
+        let output = session.output.clone();
         self.sessions
             .lock()
             .await
             .insert(session_id.clone(), session);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let initial = {
-            let mut sessions = self.sessions.lock().await;
-            sessions
-                .get_mut(&session_id)
-                .map(|s| read_available(&mut *s.reader))
-                .unwrap_or_default()
-        };
-
+        let initial = drain_buffer(&output);
         if initial.is_empty() {
             format!("Session started: {session_id}")
         } else {
@@ -235,23 +249,21 @@ impl PtyMcp {
         description = "Write text to a PTY session. Newline is NOT auto-appended — include \\n if you want to press Enter."
     )]
     async fn pty_write(&self, Parameters(params): Parameters<PtyWriteParams>) -> String {
-        let mut sessions = self.sessions.lock().await;
-        let session = match sessions.get_mut(&params.session_id) {
-            Some(s) => s,
-            None => return format!("Error: session '{}' not found", params.session_id),
+        let buffer = {
+            let mut sessions = self.sessions.lock().await;
+            let session = match sessions.get_mut(&params.session_id) {
+                Some(s) => s,
+                None => return format!("Error: session '{}' not found", params.session_id),
+            };
+            if let Err(e) = session.writer.write_all(params.input.as_bytes()) {
+                return format!("Error: write failed: {e}");
+            }
+            let _ = session.writer.flush();
+            session.output.clone()
         };
-        if let Err(e) = session.writer.write_all(params.input.as_bytes()) {
-            return format!("Error: write failed: {e}");
-        }
-        let _ = session.writer.flush();
-        drop(sessions);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mut sessions = self.sessions.lock().await;
-        let output = sessions
-            .get_mut(&params.session_id)
-            .map(|s| read_available(&mut *s.reader))
-            .unwrap_or_default();
+        let output = drain_buffer(&buffer);
         if output.is_empty() {
             "Written (no output yet — use pty_read to check later)".to_string()
         } else {
@@ -261,12 +273,14 @@ impl PtyMcp {
 
     #[tool(description = "Read available output from a PTY session.")]
     async fn pty_read(&self, Parameters(params): Parameters<PtyReadParams>) -> String {
-        let mut sessions = self.sessions.lock().await;
-        let session = match sessions.get_mut(&params.session_id) {
-            Some(s) => s,
-            None => return format!("Error: session '{}' not found", params.session_id),
+        let buffer = {
+            let sessions = self.sessions.lock().await;
+            match sessions.get(&params.session_id) {
+                Some(s) => s.output.clone(),
+                None => return format!("Error: session '{}' not found", params.session_id),
+            }
         };
-        let output = read_available(&mut *session.reader);
+        let output = drain_buffer(&buffer);
         if output.is_empty() {
             "(no new output)".to_string()
         } else {
